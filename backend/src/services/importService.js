@@ -71,6 +71,14 @@ function normalizeRow(row) {
   return { values };
 }
 
+function isCdrHeaderRow(line = "") {
+  const recognizedHeaders = ["DID No", "Group Name", "Called No", "Call Time"];
+  const headers = line.split(",").map(cleanHeader);
+  const recognizedCount = headers.filter((header) => recognizedHeaders.includes(header)).length;
+
+  return recognizedCount >= 2;
+}
+
 function parseCsv(filePath) {
 return new Promise((resolve, reject) => {
 const rows = [];
@@ -80,8 +88,8 @@ let missingColumns = null;
 const fileContent = fs.readFileSync(filePath, "utf8");
 const lines = fileContent.split(/\r?\n/);
 
-// Skip report title row
-const csvContent = lines.slice(1).join("\n");
+const headerRowIndex = [0, 1].find((index) => isCdrHeaderRow(lines[index]));
+const csvContent = lines.slice(headerRowIndex ?? 1).join("\n");
 
 Readable.from([csvContent])
   .pipe(

@@ -425,25 +425,30 @@ async function getCallsByYear(filters) {
 async function getCallsByMonth(filters) {
   const { whereSql, params } = buildWhereClause(filters);
 
-const rows = await query(
-  `
-    SELECT
-      YEAR(call_time) AS year,
-      MONTH(call_time) AS month,
-      disposition,
-      COUNT(*) AS total
-    FROM inbound_calls
-    ${whereSql}
-    GROUP BY
-      YEAR(call_time),
-      MONTH(call_time),
-      disposition
-    ORDER BY
-      YEAR(call_time),
-      MONTH(call_time)
-  `,
-  params
-);
+  const rows = await query(
+    `
+      SELECT
+        YEAR(call_time) AS year,
+        MONTH(call_time) AS month,
+        SUM(CASE WHEN ${CONNECTED_SQL} THEN 1 ELSE 0 END) AS connected,
+        SUM(CASE WHEN ${NOT_CONNECTED_SQL} THEN 1 ELSE 0 END) AS abandoned,
+        SUM(
+          CASE
+            WHEN call_end IS NULL OR call_end NOT IN ('Agent', 'Queue', 'IVR') THEN 1
+            ELSE 0
+          END
+        ) AS others
+      FROM inbound_calls
+      ${whereSql}
+      GROUP BY
+        YEAR(call_time),
+        MONTH(call_time)
+      ORDER BY
+        YEAR(call_time),
+        MONTH(call_time)
+    `,
+    params
+  );
 
   const monthNames = {
     1: "Jan",
@@ -460,61 +465,22 @@ const rows = await query(
     12: "Dec"
   };
 
-  const monthMap = {};
-
-  rows.forEach((row) => {
-   
-    const selectedYears = Array.isArray(filters.year)
-  ? filters.year
-  : filters.year
-  ? [filters.year]
-  : [];
-
-const month = monthNames[row.month];
-
-    if (!monthMap[month]) {
-  monthMap[month] = {
-    month,
-    connected: 0,
-    abandoned: 0,
-    others: 0,
-    year: row.year,
-    monthNumber: row.month
-  };
-}
-
-    if (row.disposition === "Connected") {
-      monthMap[month].connected += Number(row.total);
-    } else if (row.disposition === "Not Connected") {
-      monthMap[month].abandoned += Number(row.total);
-    } else {
-      monthMap[month].others += Number(row.total);
-    }
-  });
-
-  return Object.values(monthMap)
-  .sort((a, b) => {
-    if (a.year !== b.year) {
-      return a.year - b.year;
-    }
-    return a.monthNumber - b.monthNumber;
-  })
-  .map((item) => {
+  return rows.map((row) => {
     const total =
-      item.connected +
-      item.abandoned +
-      item.others;
+      Number(row.connected) +
+      Number(row.abandoned) +
+      Number(row.others);
 
     return {
-      month: item.month,
+      month: monthNames[row.month],
       connected: Number(
-        ((item.connected / total) * 100).toFixed(1)
+        ((Number(row.connected) / total) * 100).toFixed(1)
       ),
       abandoned: Number(
-        ((item.abandoned / total) * 100).toFixed(1)
+        ((Number(row.abandoned) / total) * 100).toFixed(1)
       ),
       others: Number(
-        ((item.others / total) * 100).toFixed(1)
+        ((Number(row.others) / total) * 100).toFixed(1)
       )
     };
   });

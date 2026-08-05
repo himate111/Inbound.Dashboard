@@ -177,6 +177,11 @@ const handleUpload = async (event) => {
       : item.name
 }));
 
+  const dispositionData = charts.dispositions.map((item) => ({
+    ...item,
+    name: item.name === "-" ? "No Disposition" : item.name
+  }));
+
   const kpiCards = useMemo(
   () => [
     {
@@ -389,7 +394,7 @@ const dropRateFiltered = charts.hourly.filter(
   <Grid item xs={12} lg={6}>
     <DonutChartCard
       title="Disposition Distribution"
-      data={charts.dispositions}
+      data={dispositionData}
     />
   </Grid>
 

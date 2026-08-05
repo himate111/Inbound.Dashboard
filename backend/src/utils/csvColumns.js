@@ -6,6 +6,7 @@ export const HEADER_ALIASES = {
   "Hold Durn": "Hold Duration",
   "Durn": "Duration",
   "Call End At": "Call End",
+  "Call Start Time": "Call Time",
   "Agent ID": "Agent"
 };
 
