@@ -7,6 +7,26 @@ const CONNECTED_SQL = "(call_end = 'Agent')";
 const NOT_CONNECTED_SQL =
   "(call_end IN ('Queue', 'IVR'))";
 
+const CONNECTED_THRESHOLD_SECONDS = 3;
+
+const SAFE_AGENT_DURATION_SECONDS_SQL = `
+  CASE
+    WHEN agent_duration IS NULL
+      OR TRIM(CAST(agent_duration AS CHAR)) = ''
+    THEN NULL
+    ELSE TIME_TO_SEC(agent_duration)
+  END
+`;
+
+const AGENT_DURATION_CONNECTED_SQL =
+  `(${SAFE_AGENT_DURATION_SECONDS_SQL} >= ${CONNECTED_THRESHOLD_SECONDS})`;
+
+const AGENT_DURATION_ABANDONED_SQL =
+  `(${SAFE_AGENT_DURATION_SECONDS_SQL} < ${CONNECTED_THRESHOLD_SECONDS})`;
+
+const AGENT_DURATION_UNCLASSIFIED_SQL =
+  `(${SAFE_AGENT_DURATION_SECONDS_SQL} IS NULL)`;
+
 function numberValue(value) {
   return Number(value || 0);
 }
@@ -16,6 +36,23 @@ function percent(part, total) {
     return 0;
   }
   return Number(((Number(part) / Number(total)) * 100).toFixed(2));
+}
+
+function percentLabel(value) {
+  return `${Number(value || 0).toFixed(1)}%`;
+}
+
+function isPlaceholder(value) {
+  const normalized = String(value ?? "").trim().toUpperCase();
+  return !normalized || ["-", "N/A", "NA", "UNKNOWN"].includes(normalized);
+}
+
+function placeholderSql(column) {
+  return `(
+    ${column} IS NULL
+    OR TRIM(CAST(${column} AS CHAR)) = ''
+    OR UPPER(TRIM(CAST(${column} AS CHAR))) IN ('-', 'N/A', 'NA', 'UNKNOWN')
+  )`;
 }
 
 function formatDate(date) {
@@ -110,8 +147,8 @@ async function getKpis(filters) {
     `
       SELECT
         COUNT(*) AS totalCalls,
-        SUM(CASE WHEN ${CONNECTED_SQL} THEN 1 ELSE 0 END) AS connectedCalls,
-        SUM(CASE WHEN ${NOT_CONNECTED_SQL} THEN 1 ELSE 0 END) AS notConnectedCalls,
+        SUM(CASE WHEN ${AGENT_DURATION_CONNECTED_SQL} THEN 1 ELSE 0 END) AS connectedCalls,
+        SUM(CASE WHEN ${AGENT_DURATION_ABANDONED_SQL} THEN 1 ELSE 0 END) AS notConnectedCalls,
         AVG(TIME_TO_SEC(total_duration)) AS avgCallDurationSeconds,
         AVG(TIME_TO_SEC(agent_duration)) AS avgAgentDurationSeconds,
         AVG(TIME_TO_SEC(queue_duration)) AS avgQueueDurationSeconds
@@ -249,156 +286,201 @@ async function getHourly(filters) {
   });
 }
 
-function executiveSummary({ kpis, charts, topAgents, hourly, trend }) {
-  const insights = [];
+async function getSummaryShiftMetrics(filters) {
+  const { whereSql, params } = buildWhereClause(filters);
+  const rows = await query(
+    `
+      SELECT
+        COALESCE(NULLIF(shift, ''), 'Unknown') AS name,
+        COUNT(*) AS totalCalls,
+        SUM(CASE WHEN ${AGENT_DURATION_CONNECTED_SQL} THEN 1 ELSE 0 END) AS connectedCalls,
+        SUM(CASE WHEN ${AGENT_DURATION_ABANDONED_SQL} THEN 1 ELSE 0 END) AS abandonedCalls,
+        SUM(CASE WHEN ${AGENT_DURATION_UNCLASSIFIED_SQL} THEN 1 ELSE 0 END) AS unclassifiedCalls
+      FROM inbound_calls
+      ${whereSql}
+      GROUP BY name
+      ORDER BY name
+    `,
+    params
+  );
 
+  return rows.map((row) => {
+    const totalCalls = numberValue(row.totalCalls);
+    const abandonedCalls = numberValue(row.abandonedCalls);
+    return {
+      name: row.name || "Unknown",
+      totalCalls,
+      connectedCalls: numberValue(row.connectedCalls),
+      abandonedCalls,
+      unclassifiedCalls: numberValue(row.unclassifiedCalls),
+      abandonmentRate: percent(abandonedCalls, totalCalls)
+    };
+  });
+}
+
+async function getDataQualityMetrics(filters) {
+  const { whereSql, params } = buildWhereClause(filters);
+  const [row = {}] = await query(
+    `
+      SELECT
+        COUNT(*) AS totalCalls,
+        SUM(CASE WHEN ${placeholderSql("disposition")} THEN 1 ELSE 0 END) AS invalidDispositionCount,
+        SUM(CASE WHEN ${placeholderSql("sub_disposition")} THEN 1 ELSE 0 END) AS invalidSubDispositionCount,
+        SUM(CASE WHEN ${placeholderSql("agent_id")} THEN 1 ELSE 0 END) AS invalidAgentIdCount,
+        SUM(CASE WHEN ${placeholderSql("group_name")} THEN 1 ELSE 0 END) AS invalidGroupNameCount,
+        SUM(CASE WHEN ${SAFE_AGENT_DURATION_SECONDS_SQL} IS NULL THEN 1 ELSE 0 END) AS missingAgentDurationCount,
+        SUM(CASE WHEN total_duration IS NULL OR TRIM(CAST(total_duration AS CHAR)) = '' THEN 1 ELSE 0 END) AS missingTotalDurationCount,
+        SUM(CASE WHEN TIME_TO_SEC(agent_duration) < 0 THEN 1 ELSE 0 END) AS negativeAgentDurationCount,
+        SUM(CASE WHEN TIME_TO_SEC(total_duration) < 0 THEN 1 ELSE 0 END) AS negativeTotalDurationCount,
+        SUM(CASE WHEN ${SAFE_AGENT_DURATION_SECONDS_SQL} IS NOT NULL AND total_duration IS NOT NULL AND TIME_TO_SEC(agent_duration) > TIME_TO_SEC(total_duration) THEN 1 ELSE 0 END) AS agentDurationExceedsTotalCount,
+        SUM(CASE WHEN ${AGENT_DURATION_ABANDONED_SQL} AND call_end = 'Agent' THEN 1 ELSE 0 END) AS durationAbandonedAgentEndCount,
+        SUM(CASE WHEN ${AGENT_DURATION_CONNECTED_SQL} AND (call_end IS NULL OR call_end <> 'Agent') THEN 1 ELSE 0 END) AS durationConnectedNonAgentEndCount
+      FROM inbound_calls
+      ${whereSql}
+    `,
+    params
+  );
+
+  const totalCalls = numberValue(row.totalCalls);
+  const quality = {
+    totalCalls,
+    invalidDispositionCount: numberValue(row.invalidDispositionCount),
+    invalidSubDispositionCount: numberValue(row.invalidSubDispositionCount),
+    invalidAgentIdCount: numberValue(row.invalidAgentIdCount),
+    invalidGroupNameCount: numberValue(row.invalidGroupNameCount),
+    missingAgentDurationCount: numberValue(row.missingAgentDurationCount),
+    missingTotalDurationCount: numberValue(row.missingTotalDurationCount),
+    negativeAgentDurationCount: numberValue(row.negativeAgentDurationCount),
+    negativeTotalDurationCount: numberValue(row.negativeTotalDurationCount),
+    agentDurationExceedsTotalCount: numberValue(row.agentDurationExceedsTotalCount),
+    durationAbandonedAgentEndCount: numberValue(row.durationAbandonedAgentEndCount),
+    durationConnectedNonAgentEndCount: numberValue(row.durationConnectedNonAgentEndCount)
+  };
+
+  return {
+    ...quality,
+    invalidDispositionPercentage: percent(quality.invalidDispositionCount, totalCalls),
+    invalidSubDispositionPercentage: percent(quality.invalidSubDispositionCount, totalCalls),
+    invalidAgentIdPercentage: percent(quality.invalidAgentIdCount, totalCalls),
+    invalidGroupNamePercentage: percent(quality.invalidGroupNameCount, totalCalls)
+  };
+}
+
+async function getSummaryMetrics(filters, kpis, charts, hourly) {
+  const [shifts, dataQuality] = await Promise.all([
+    getSummaryShiftMetrics(filters),
+    getDataQualityMetrics(filters)
+  ]);
   const peakHour = hourly.reduce(
-    (best, row) =>
-      row.totalCalls > best.totalCalls ? row : best,
+    (best, row) => (row.totalCalls > best.totalCalls ? row : best),
     hourly[0] || {}
   );
-
-  const topGroup = charts.groups[0];
-
-  const topSubDisposition =
-    charts.topSubDispositions[0];
-
-  const shiftTotals =
-    charts.connectedByShift.map((shift) => {
-      const missed =
-        charts.notConnectedByShift.find(
-          (s) => s.name === shift.name
-        )?.value || 0;
-
-      return {
-        name: shift.name,
-        connected: shift.value,
-        missed,
-        total: shift.value + missed
-      };
-    });
-
-  const worstShift = shiftTotals.reduce(
-    (a, b) => (b.missed > a.missed ? b : a),
-    shiftTotals[0]
+  const topGroup = charts.groups.find((group) => !isPlaceholder(group.name));
+  const topSubDisposition = charts.topSubDispositions.find(
+    (item) => !isPlaceholder(item.name)
+  );
+  const highestAbandonmentRateShift = shifts.reduce(
+    (best, shift) => !best || shift.abandonmentRate > best.abandonmentRate ? shift : best,
+    null
   );
 
-  if (kpis.connectionRate >= 95) {
-    insights.push(
-      `Inbound operations are performing efficiently with a ${Math.round(
-        kpis.connectionRate
-      )}% connection rate.`
-    );
-  } else {
-    insights.push(
-      `Connection performance is below expectation at ${Math.round(
-        kpis.connectionRate
-      )}%, indicating potential service gaps.`
-    );
-  }
+  return {
+    kpis,
+    peakHour,
+    peakHourShare: percent(peakHour?.totalCalls, kpis.totalCalls),
+    topGroup,
+    topGroupShare: percent(topGroup?.value, kpis.totalCalls),
+    topSubDisposition,
+    meaningfulSubDispositionCoverage: 100 - dataQuality.invalidSubDispositionPercentage,
+    highestAbandonmentRateShift,
+    dataQuality
+  };
+}
 
-  if (peakHour?.totalCalls) {
-    insights.push(
-      `Call demand peaks around ${peakHour.label}, making this the most critical staffing period.`
-    );
-  }
+function buildInsights(metrics) {
+  const insights = [];
+  const { kpis, peakHour, peakHourShare, topGroup, topGroupShare, topSubDisposition, meaningfulSubDispositionCoverage, highestAbandonmentRateShift } = metrics;
 
+  if (kpis.totalCalls > 0) {
+    if (kpis.connectionRate >= 95) {
+      insights.push(`${percentLabel(kpis.connectionRate)} of ${kpis.totalCalls.toLocaleString()} customer calls were connected, showing strong service performance.`);
+    } else if (kpis.connectionRate >= 90) {
+      insights.push(`${percentLabel(kpis.connectionRate)} of customer calls were connected. Performance is healthy, with an opportunity to reduce calls that end early.`);
+    } else {
+      insights.push(`${percentLabel(kpis.connectionRate)} of customer calls were connected, highlighting an opportunity to improve call completion.`);
+    }
+  }
+  if (peakHour?.totalCalls > 0) {
+    insights.push(`Customer call demand was highest at ${peakHour.label}, with ${peakHour.totalCalls.toLocaleString()} calls (${percentLabel(peakHourShare)} of all calls).`);
+  }
   if (topGroup) {
-    const share = Math.round(
-      (topGroup.value / kpis.totalCalls) * 100
-    );
-
-    insights.push(
-      `${topGroup.name} contributes ${share}% of total inbound traffic, indicating strong volume concentration.`
-    );
+    insights.push(topGroupShare >= 60
+      ? `${topGroup.name} handled ${percentLabel(topGroupShare)} of customer calls, making it the main inbound group for this period.`
+      : `Customer calls were shared across inbound groups, with ${topGroup.name} handling the largest share at ${percentLabel(topGroupShare)}.`);
   }
-
-  if (topSubDisposition) {
-    const share = Math.round(
-      (topSubDisposition.value / kpis.totalCalls) * 100
-    );
-
-    insights.push(
-      `${topSubDisposition.name} accounts for ${share}% of all enquiries and remains the dominant customer requirement.`
-    );
+  if (highestAbandonmentRateShift?.totalCalls > 0 && highestAbandonmentRateShift.abandonedCalls > 0) {
+    insights.push(`${highestAbandonmentRateShift.name} had the highest rate of calls ending early at ${percentLabel(highestAbandonmentRateShift.abandonmentRate)} (${highestAbandonmentRateShift.abandonedCalls.toLocaleString()} calls).`);
   }
-
-  if (worstShift?.missed > 0) {
-    insights.push(
-      `${worstShift.name} generates the highest abandonment volume (${worstShift.missed} calls), suggesting staffing or routing constraints.`
-    );
+  if (topSubDisposition && meaningfulSubDispositionCoverage >= 50) {
+    insights.push(`${topSubDisposition.name} was the most common recorded reason for contact, representing ${percentLabel(percent(topSubDisposition.value, kpis.totalCalls))} of calls.`);
   }
-
   return insights.slice(0, 5);
 }
 
-function performanceIssues({ kpis, charts }) {
+function buildPerformanceIssues(metrics) {
   const issues = [];
-
-  const totalMissed =
-    charts.notConnectedByShift.reduce(
-      (sum, s) => sum + s.value,
-      0
-    );
-
-  const worstShift =
-    charts.notConnectedByShift.reduce(
-      (a, b) => (b.value > a.value ? b : a),
-      charts.notConnectedByShift[0]
-    );
-
-  if (
-    worstShift &&
-    totalMissed > 0 &&
-    worstShift.value / totalMissed > 0.4
-  ) {
-    issues.push(
-      `${worstShift.name} contributes ${Math.round(
-        (worstShift.value / totalMissed) * 100
-      )}% of all missed calls.`
-    );
-  }
+  const { kpis, topGroupShare, highestAbandonmentRateShift } = metrics;
 
   if (kpis.notConnectedPercentage > 5) {
-    issues.push(
-      `${Math.round(
-        kpis.notConnectedPercentage
-      )}% of inbound calls are not reaching an agent.`
-    );
+    issues.push(`${percentLabel(kpis.notConnectedPercentage)} of calls ended early, which is above the preferred service range.`);
+  } else if (kpis.notConnectedPercentage > 3) {
+    issues.push(`${percentLabel(kpis.notConnectedPercentage)} of calls ended early. This is elevated and should be monitored.`);
   }
-
+  if (highestAbandonmentRateShift && highestAbandonmentRateShift.abandonmentRate >= kpis.notConnectedPercentage + 1) {
+    issues.push(`${highestAbandonmentRateShift.name} had ${percentLabel(highestAbandonmentRateShift.abandonmentRate)} of calls end early, compared with ${percentLabel(kpis.notConnectedPercentage)} overall. This indicates a service issue during that shift.`);
+  }
   if (kpis.avgQueueDurationSeconds > 60) {
-    issues.push(
-      `Customers wait an average of ${kpis.avgQueueDuration} before connection.`
-    );
+    issues.push(`Customers waited an average of ${kpis.avgQueueDuration} before reaching an agent, which may affect their experience.`);
+  } else if (kpis.avgQueueDurationSeconds >= 30) {
+    issues.push(`Customers waited an average of ${kpis.avgQueueDuration} before reaching an agent. This is elevated and should be monitored.`);
   }
-
+  if (topGroupShare >= 60) {
+    issues.push(`A large share of customer calls (${percentLabel(topGroupShare)}) is handled by a single inbound group. Monitoring this workload can help avoid service disruption.`);
+  }
   return issues.slice(0, 3);
 }
 
-function recommendations({ kpis, charts }) {
+function buildDataQualityObservations(dataQuality) {
+  const observations = [];
+  const disagreementCount = dataQuality.durationAbandonedAgentEndCount + dataQuality.durationConnectedNonAgentEndCount;
+  const durationIssueCount = dataQuality.missingAgentDurationCount + dataQuality.missingTotalDurationCount + dataQuality.negativeAgentDurationCount + dataQuality.negativeTotalDurationCount + dataQuality.agentDurationExceedsTotalCount;
+
+  if (disagreementCount > 0) observations.push(`${disagreementCount.toLocaleString()} calls contain inconsistent information between call status and agent talk time. Reviewing these records will improve reporting accuracy.`);
+  if (dataQuality.invalidDispositionCount > 0) observations.push(`The call outcome has not been recorded clearly for ${percentLabel(dataQuality.invalidDispositionPercentage)} of records, which limits outcome analysis.`);
+  if (dataQuality.invalidSubDispositionCount > 0) observations.push(`The reason for the customer contact has not been recorded clearly for ${percentLabel(dataQuality.invalidSubDispositionPercentage)} of calls, limiting insight into customer needs.`);
+  if (dataQuality.invalidAgentIdCount > 0) observations.push(`Agent information is missing for ${percentLabel(dataQuality.invalidAgentIdPercentage)} of records, which may affect agent performance reporting.`);
+  if (dataQuality.invalidGroupNameCount > 0) observations.push(`Inbound group information is missing for ${percentLabel(dataQuality.invalidGroupNamePercentage)} of records.`);
+  if (durationIssueCount > 0) observations.push(`${durationIssueCount.toLocaleString()} records have incomplete or inconsistent call timing information and should be reviewed.`);
+  return observations.slice(0, 4);
+}
+
+function buildRecommendations(metrics) {
   const recommendations = [];
+  const { kpis, peakHour, peakHourShare, topGroupShare, highestAbandonmentRateShift, dataQuality } = metrics;
+  const disagreementCount = dataQuality.durationAbandonedAgentEndCount + dataQuality.durationConnectedNonAgentEndCount;
 
-  recommendations.push(
-    "Align staffing levels with the 11:00–14:00 peak demand window."
-  );
-
-  const topDisposition =
-    charts.topSubDispositions[0];
-
-  if (topDisposition) {
-    recommendations.push(
-      `Review automation opportunities for ${topDisposition.name} enquiries to reduce agent workload.`
-    );
+  if (disagreementCount > 0) recommendations.push(`Review the ${disagreementCount.toLocaleString()} calls where call information does not match, so reports accurately reflect customer interactions.`);
+  if (dataQuality.invalidSubDispositionPercentage >= 10) {
+    recommendations.push(`The reason for many customer calls has not been recorded. Capturing this information consistently will provide more meaningful operational insight for the ${percentLabel(dataQuality.invalidSubDispositionPercentage)} of affected records.`);
+  } else if (dataQuality.invalidDispositionPercentage >= 10) {
+    recommendations.push(`The outcome of many customer calls has not been recorded clearly. Improving this for the ${percentLabel(dataQuality.invalidDispositionPercentage)} of affected records will strengthen performance reporting.`);
   }
-
-  if (kpis.notConnectedPercentage > 3) {
-    recommendations.push(
-      "Investigate abandonment patterns by shift and improve call routing efficiency."
-    );
-  }
-
-  return recommendations.slice(0, 3);
+  if (kpis.notConnectedPercentage > 3) recommendations.push(`Review staffing and call handling during the periods contributing most to the ${percentLabel(kpis.notConnectedPercentage)} of calls ending early.`);
+  if (highestAbandonmentRateShift && highestAbandonmentRateShift.abandonmentRate >= kpis.notConnectedPercentage + 1) recommendations.push(`Prioritise ${highestAbandonmentRateShift.name} for a staffing and call-handling review. ${percentLabel(highestAbandonmentRateShift.abandonmentRate)} of its calls ended early, compared with ${percentLabel(kpis.notConnectedPercentage)} overall.`);
+  if (topGroupShare >= 60) recommendations.push(`Most customer calls are handled by one inbound group. Ensuring this group has adequate staffing will help maintain service levels during busy periods.`);
+  if (peakHour?.totalCalls > 0 && peakHourShare >= 10) recommendations.push(`Plan staffing around the ${peakHour.label} peak, when ${peakHour.totalCalls.toLocaleString()} calls were received (${percentLabel(peakHourShare)} of all calls).`);
+  if (!recommendations.length && kpis.totalCalls > 0) recommendations.push(`Maintain the current service approach while monitoring the ${percentLabel(kpis.notConnectedPercentage)} of calls ending early and demand around ${peakHour?.label || "the busiest hour"}.`);
+  return recommendations.slice(0, 4);
 }
 
 
@@ -430,14 +512,9 @@ async function getCallsByMonth(filters) {
       SELECT
         YEAR(call_time) AS year,
         MONTH(call_time) AS month,
-        SUM(CASE WHEN ${CONNECTED_SQL} THEN 1 ELSE 0 END) AS connected,
-        SUM(CASE WHEN ${NOT_CONNECTED_SQL} THEN 1 ELSE 0 END) AS abandoned,
-        SUM(
-          CASE
-            WHEN call_end IS NULL OR call_end NOT IN ('Agent', 'Queue', 'IVR') THEN 1
-            ELSE 0
-          END
-        ) AS others
+        SUM(CASE WHEN ${AGENT_DURATION_CONNECTED_SQL} THEN 1 ELSE 0 END) AS connected,
+        SUM(CASE WHEN ${AGENT_DURATION_ABANDONED_SQL} THEN 1 ELSE 0 END) AS abandoned,
+        SUM(CASE WHEN ${AGENT_DURATION_UNCLASSIFIED_SQL} THEN 1 ELSE 0 END) AS others
       FROM inbound_calls
       ${whereSql}
       GROUP BY
@@ -532,7 +609,7 @@ export async function getDashboard(filters = {}) {
 callsByMonth
   };
 
-  const trend = await getConnectionTrend(filters, kpis.connectionRate);
+  const summaryMetrics = await getSummaryMetrics(filters, kpis, charts, hourly);
 
   return {
     success: true,
@@ -543,9 +620,10 @@ callsByMonth
       bottomAgents
     },
     summary: {
-      executive: executiveSummary({ kpis, charts, topAgents, hourly, trend }),
-      issues: performanceIssues({ kpis, charts }),
-      recommendations: recommendations({ kpis, charts })
+      executive: buildInsights(summaryMetrics),
+      issues: buildPerformanceIssues(summaryMetrics),
+      dataQuality: buildDataQualityObservations(summaryMetrics.dataQuality),
+      recommendations: buildRecommendations(summaryMetrics)
     }
   };
 }

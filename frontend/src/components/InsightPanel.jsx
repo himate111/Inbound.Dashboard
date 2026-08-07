@@ -23,6 +23,7 @@ function InsightPanel({ summary }) {
       </Typography>
       <InsightBlock title="Insights" items={summary.executive || []} />
       <InsightBlock title="Performance Issues" items={summary.issues || []} />
+      <InsightBlock title="Data Quality Observations" items={summary.dataQuality || []} />
       <InsightBlock title="Recommendations" items={summary.recommendations || []} />
     </Paper>
   );

@@ -95,23 +95,6 @@ function MonthlyStackedChart({ title, data }) {
                 />
             </Bar>
 
-            <Bar
-              dataKey="others"
-              stackId="a"
-              fill="#235789"
-              name="Others"
-            >
-              <LabelList
-                dataKey="others"
-                position="center"
-                formatter={(v) => `${v}%`}
-                style={{
-                    fontSize: 10,
-                    fontWeight: 600,
-                    fill: "#fff"
-                }}
-                />
-            </Bar>
           </BarChart>
         </ResponsiveContainer>
       </div>
