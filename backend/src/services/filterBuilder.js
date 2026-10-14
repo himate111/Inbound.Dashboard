@@ -1,33 +1,18 @@
+import { sql } from "../config/db.js";
+
 const FILTER_MAP = {
   groupName: "group_name",
   agent: "agent_id",
   disposition: "disposition",
   subDisposition: "sub_disposition",
-  shift: "shift"
+  shift: "shift",
+  acd: "acd",
+  callType: "call_type"
 };
 
-function normalizeList(value) {
-  if (value === undefined || value === null || value === "") {
-    return [];
-  }
-  const values = Array.isArray(value) ? value : String(value).split(",");
-  return values.map((item) => String(item).trim()).filter(Boolean);
-}
+let nextParameterId = 1;
 
-export function buildWhereClause(filters = {}, options = {}) {
-  const clauses = [];
-  const params = [];
-
-  const years = normalizeList(filters.year);
-
-if (years.length > 0) {
-  clauses.push(
-    `YEAR(call_time) IN (${years.map(() => "?").join(",")})`
-  );
-  params.push(...years.map(Number));
-}
-
- const monthMap = {
+const MONTH_MAP = {
   Jan: 1,
   Feb: 2,
   Mar: 3,
@@ -42,35 +27,71 @@ if (years.length > 0) {
   Dec: 12
 };
 
-const months = normalizeList(filters.month);
+function normalizeList(value) {
+  if (value === undefined || value === null || value === "") {
+    return [];
+  }
 
-if (months.length > 0) {
-  const monthNumbers = months.map(
-    (month) => monthMap[month] || Number(month)
-  );
-
-  clauses.push(
-    `MONTH(call_time) IN (${monthNumbers.map(() => "?").join(",")})`
-  );
-
-  params.push(...monthNumbers);
+  const values = Array.isArray(value) ? value : String(value).split(",");
+  return values.map((item) => String(item).trim()).filter(Boolean);
 }
 
+function addParameter(params, type, value) {
+  const name = `filter_${nextParameterId++}`;
+  params.push({ name, type, value });
+  return `@${name}`;
+}
+
+function formatDateTime(date, time) {
+  return `${date} ${time}`;
+}
+
+export function buildWhereClause(filters = {}, options = {}) {
+  const clauses = [];
+  const params = [];
+  const years = normalizeList(filters.year);
+
+  if (years.length > 0) {
+    const placeholders = years.map((year) =>
+      addParameter(params, sql.Int, Number(year))
+    );
+    clauses.push(`YEAR(call_time) IN (${placeholders.join(", ")})`);
+  }
+
+  const months = normalizeList(filters.month);
+
+  if (months.length > 0) {
+    const placeholders = months.map((month) =>
+      addParameter(params, sql.Int, MONTH_MAP[month] || Number(month))
+    );
+    clauses.push(`MONTH(call_time) IN (${placeholders.join(", ")})`);
+  }
+
   if (filters.startDate) {
-    clauses.push("call_time >= ?");
-    params.push(`${filters.startDate} 00:00:00`);
+    const parameter = addParameter(
+      params,
+      sql.NVarChar(19),
+      formatDateTime(filters.startDate, "00:00:00")
+    );
+    clauses.push(`call_time >= CONVERT(datetime2(0), ${parameter}, 120)`);
   }
 
   if (filters.endDate) {
-    clauses.push("call_time <= ?");
-    params.push(`${filters.endDate} 23:59:59`);
+    const parameter = addParameter(
+      params,
+      sql.NVarChar(19),
+      formatDateTime(filters.endDate, "23:59:59")
+    );
+    clauses.push(`call_time <= CONVERT(datetime2(0), ${parameter}, 120)`);
   }
 
   Object.entries(FILTER_MAP).forEach(([filterKey, columnName]) => {
     const values = normalizeList(filters[filterKey]);
     if (values.length > 0) {
-      clauses.push(`${columnName} IN (${values.map(() => "?").join(", ")})`);
-      params.push(...values);
+      const placeholders = values.map((value) =>
+        addParameter(params, sql.NVarChar, value)
+      );
+      clauses.push(`${columnName} IN (${placeholders.join(", ")})`);
     }
   });
 

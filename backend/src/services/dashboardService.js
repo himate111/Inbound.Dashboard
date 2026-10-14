@@ -1,6 +1,7 @@
 import { pool } from "../config/db.js";
 import { buildWhereClause } from "./filterBuilder.js";
 import { secondsToLabel } from "../utils/time.js";
+import { runWithGlobalSqlConcurrency } from "./sqlQueryLimiter.js";
 
 const CONNECTED_SQL = "(call_end = 'Agent')";
 
@@ -11,10 +12,8 @@ const CONNECTED_THRESHOLD_SECONDS = 3;
 
 const SAFE_AGENT_DURATION_SECONDS_SQL = `
   CASE
-    WHEN agent_duration IS NULL
-      OR TRIM(CAST(agent_duration AS CHAR)) = ''
-    THEN NULL
-    ELSE TIME_TO_SEC(agent_duration)
+    WHEN agent_duration IS NULL THEN NULL
+    ELSE DATEDIFF(SECOND, CAST('00:00:00' AS time), agent_duration)
   END
 `;
 
@@ -50,8 +49,8 @@ function isPlaceholder(value) {
 function placeholderSql(column) {
   return `(
     ${column} IS NULL
-    OR TRIM(CAST(${column} AS CHAR)) = ''
-    OR UPPER(TRIM(CAST(${column} AS CHAR))) IN ('-', 'N/A', 'NA', 'UNKNOWN')
+    OR LTRIM(RTRIM(${column})) = ''
+    OR UPPER(LTRIM(RTRIM(${column}))) IN ('-', 'N/A', 'NA', 'UNKNOWN')
   )`;
 }
 
@@ -70,22 +69,30 @@ function chartRows(rows, nameKey = "name", valueKey = "value") {
   }));
 }
 
-async function query(sql, params = []) {
-  const [rows] = await pool.execute(sql, params);
-  return rows;
+async function query(queryText, params = []) {
+  return runWithGlobalSqlConcurrency(async () => {
+    const request = pool.request();
+
+    params.forEach(({ name, type, value }) => {
+      request.input(name, type, value);
+    });
+
+    const result = await request.query(queryText);
+    return result.recordset;
+  });
 }
 
 async function groupedChart({ selectExpression, alias = "name", filters, orderBy = "value DESC", limit }) {
   const { whereSql, params } = buildWhereClause(filters);
-  const limitSql = limit ? `LIMIT ${Number(limit)}` : "";
+  const topSql = limit ? `TOP (${Number(limit)}) ` : "";
+  const groupExpression = `COALESCE(NULLIF(${selectExpression}, ''), 'Unknown')`;
   const rows = await query(
     `
-      SELECT COALESCE(NULLIF(${selectExpression}, ''), 'Unknown') AS ${alias}, COUNT(*) AS value
-      FROM inbound_calls
+      SELECT ${topSql}${groupExpression} AS ${alias}, COUNT(*) AS value
+      FROM dbo.inbound_calls
       ${whereSql}
-      GROUP BY ${alias}
+      GROUP BY ${groupExpression}
       ORDER BY ${orderBy}
-      ${limitSql}
     `,
     params
   );
@@ -97,9 +104,9 @@ async function shiftMetricChart(filters, metricSql) {
   const rows = await query(
     `
       SELECT COALESCE(NULLIF(shift, ''), 'Unknown') AS name, SUM(CASE WHEN ${metricSql} THEN 1 ELSE 0 END) AS value
-      FROM inbound_calls
+      FROM dbo.inbound_calls
       ${whereSql}
-      GROUP BY name
+      GROUP BY COALESCE(NULLIF(shift, ''), 'Unknown')
       ORDER BY name
     `,
     params
@@ -116,17 +123,16 @@ async function agentAnalytics(filters, direction = "top") {
 
   const rows = await query(
     `
-      SELECT
+      SELECT TOP (10)
         agent_id AS agent,
         COUNT(*) AS totalCalls,
         SUM(CASE WHEN ${CONNECTED_SQL} THEN 1 ELSE 0 END) AS connectedCalls,
-        ROUND((SUM(CASE WHEN ${CONNECTED_SQL} THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0)) * 100, 2) AS connectionRate,
-        AVG(TIME_TO_SEC(agent_duration)) AS avgAgentDurationSeconds
-      FROM inbound_calls
+        ROUND((100.0 * SUM(CASE WHEN ${CONNECTED_SQL} THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0)), 2) AS connectionRate,
+        AVG(DATEDIFF(SECOND, CAST('00:00:00' AS time), agent_duration)) AS avgAgentDurationSeconds
+      FROM dbo.inbound_calls
       ${whereSql}
       GROUP BY agent_id
       ORDER BY ${orderSql}
-      LIMIT 10
     `,
     params
   );
@@ -149,10 +155,10 @@ async function getKpis(filters) {
         COUNT(*) AS totalCalls,
         SUM(CASE WHEN ${AGENT_DURATION_CONNECTED_SQL} THEN 1 ELSE 0 END) AS connectedCalls,
         SUM(CASE WHEN ${AGENT_DURATION_ABANDONED_SQL} THEN 1 ELSE 0 END) AS notConnectedCalls,
-        AVG(TIME_TO_SEC(total_duration)) AS avgCallDurationSeconds,
-        AVG(TIME_TO_SEC(agent_duration)) AS avgAgentDurationSeconds,
-        AVG(TIME_TO_SEC(queue_duration)) AS avgQueueDurationSeconds
-      FROM inbound_calls
+        AVG(DATEDIFF(SECOND, CAST('00:00:00' AS time), total_duration)) AS avgCallDurationSeconds,
+        AVG(DATEDIFF(SECOND, CAST('00:00:00' AS time), agent_duration)) AS avgAgentDurationSeconds,
+        AVG(DATEDIFF(SECOND, CAST('00:00:00' AS time), queue_duration)) AS avgQueueDurationSeconds
+      FROM dbo.inbound_calls
       ${whereSql}
     `,
     params
@@ -263,8 +269,8 @@ async function getHourly(filters) {
         COUNT(*) AS totalCalls,
         SUM(CASE WHEN ${CONNECTED_SQL} THEN 1 ELSE 0 END) AS connectedCalls,
         SUM(CASE WHEN ${NOT_CONNECTED_SQL} THEN 1 ELSE 0 END) AS notConnectedCalls,
-        ROUND((SUM(CASE WHEN ${NOT_CONNECTED_SQL} THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0)) * 100, 2) AS dropRate
-      FROM inbound_calls
+        ROUND((100.0 * SUM(CASE WHEN ${NOT_CONNECTED_SQL} THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0)), 2) AS dropRate
+      FROM dbo.inbound_calls
       ${whereSql}
       GROUP BY call_hour
       ORDER BY call_hour
@@ -296,9 +302,9 @@ async function getSummaryShiftMetrics(filters) {
         SUM(CASE WHEN ${AGENT_DURATION_CONNECTED_SQL} THEN 1 ELSE 0 END) AS connectedCalls,
         SUM(CASE WHEN ${AGENT_DURATION_ABANDONED_SQL} THEN 1 ELSE 0 END) AS abandonedCalls,
         SUM(CASE WHEN ${AGENT_DURATION_UNCLASSIFIED_SQL} THEN 1 ELSE 0 END) AS unclassifiedCalls
-      FROM inbound_calls
+      FROM dbo.inbound_calls
       ${whereSql}
-      GROUP BY name
+      GROUP BY COALESCE(NULLIF(shift, ''), 'Unknown')
       ORDER BY name
     `,
     params
@@ -329,13 +335,13 @@ async function getDataQualityMetrics(filters) {
         SUM(CASE WHEN ${placeholderSql("agent_id")} THEN 1 ELSE 0 END) AS invalidAgentIdCount,
         SUM(CASE WHEN ${placeholderSql("group_name")} THEN 1 ELSE 0 END) AS invalidGroupNameCount,
         SUM(CASE WHEN ${SAFE_AGENT_DURATION_SECONDS_SQL} IS NULL THEN 1 ELSE 0 END) AS missingAgentDurationCount,
-        SUM(CASE WHEN total_duration IS NULL OR TRIM(CAST(total_duration AS CHAR)) = '' THEN 1 ELSE 0 END) AS missingTotalDurationCount,
-        SUM(CASE WHEN TIME_TO_SEC(agent_duration) < 0 THEN 1 ELSE 0 END) AS negativeAgentDurationCount,
-        SUM(CASE WHEN TIME_TO_SEC(total_duration) < 0 THEN 1 ELSE 0 END) AS negativeTotalDurationCount,
-        SUM(CASE WHEN ${SAFE_AGENT_DURATION_SECONDS_SQL} IS NOT NULL AND total_duration IS NOT NULL AND TIME_TO_SEC(agent_duration) > TIME_TO_SEC(total_duration) THEN 1 ELSE 0 END) AS agentDurationExceedsTotalCount,
+        SUM(CASE WHEN total_duration IS NULL THEN 1 ELSE 0 END) AS missingTotalDurationCount,
+        SUM(CASE WHEN DATEDIFF(SECOND, CAST('00:00:00' AS time), agent_duration) < 0 THEN 1 ELSE 0 END) AS negativeAgentDurationCount,
+        SUM(CASE WHEN DATEDIFF(SECOND, CAST('00:00:00' AS time), total_duration) < 0 THEN 1 ELSE 0 END) AS negativeTotalDurationCount,
+        SUM(CASE WHEN ${SAFE_AGENT_DURATION_SECONDS_SQL} IS NOT NULL AND total_duration IS NOT NULL AND DATEDIFF(SECOND, CAST('00:00:00' AS time), agent_duration) > DATEDIFF(SECOND, CAST('00:00:00' AS time), total_duration) THEN 1 ELSE 0 END) AS agentDurationExceedsTotalCount,
         SUM(CASE WHEN ${AGENT_DURATION_ABANDONED_SQL} AND call_end = 'Agent' THEN 1 ELSE 0 END) AS durationAbandonedAgentEndCount,
         SUM(CASE WHEN ${AGENT_DURATION_CONNECTED_SQL} AND (call_end IS NULL OR call_end <> 'Agent') THEN 1 ELSE 0 END) AS durationConnectedNonAgentEndCount
-      FROM inbound_calls
+      FROM dbo.inbound_calls
       ${whereSql}
     `,
     params
@@ -492,7 +498,7 @@ async function getCallsByYear(filters) {
       SELECT
         YEAR(call_time) AS name,
         COUNT(*) AS value
-      FROM inbound_calls
+      FROM dbo.inbound_calls
       ${whereSql}
       GROUP BY YEAR(call_time)
       ORDER BY YEAR(call_time)
@@ -515,7 +521,7 @@ async function getCallsByMonth(filters) {
         SUM(CASE WHEN ${AGENT_DURATION_CONNECTED_SQL} THEN 1 ELSE 0 END) AS connected,
         SUM(CASE WHEN ${AGENT_DURATION_ABANDONED_SQL} THEN 1 ELSE 0 END) AS abandoned,
         SUM(CASE WHEN ${AGENT_DURATION_UNCLASSIFIED_SQL} THEN 1 ELSE 0 END) AS others
-      FROM inbound_calls
+      FROM dbo.inbound_calls
       ${whereSql}
       GROUP BY
         YEAR(call_time),
@@ -563,6 +569,24 @@ async function getCallsByMonth(filters) {
   });
 }
 
+async function runWithConcurrency(tasks, concurrencyLimit) {
+  const results = new Array(tasks.length);
+  let nextTaskIndex = 0;
+
+  async function worker() {
+    while (nextTaskIndex < tasks.length) {
+      const taskIndex = nextTaskIndex;
+      nextTaskIndex += 1;
+      results[taskIndex] = await tasks[taskIndex]();
+    }
+  }
+
+  const workerCount = Math.min(concurrencyLimit, tasks.length);
+  await Promise.all(Array.from({ length: workerCount }, worker));
+
+  return results;
+}
+
 export async function getDashboard(filters = {}) {
   const [
   kpis,
@@ -578,21 +602,21 @@ export async function getDashboard(filters = {}) {
   callsByYear,
   callsByMonth,
   hourly
-] = await Promise.all([
-  getKpis(filters),
-  groupedChart({ selectExpression: "call_end", filters }),
-  groupedChart({ selectExpression: "disposition", filters }),
-  groupedChart({ selectExpression: "group_name", filters }),
-  groupedChart({ selectExpression: "shift", filters, orderBy: "name ASC" }),
-  shiftMetricChart(filters, CONNECTED_SQL),
-  shiftMetricChart(filters, NOT_CONNECTED_SQL),
-  groupedChart({ selectExpression: "sub_disposition", filters, limit: 5 }),
-  agentAnalytics(filters, "top"),
-  agentAnalytics(filters, "bottom"),
-  getCallsByYear(filters),
-  getCallsByMonth(filters),
-  getHourly(filters)
-]);
+] = await runWithConcurrency([
+  () => getKpis(filters),
+  () => groupedChart({ selectExpression: "call_end", filters }),
+  () => groupedChart({ selectExpression: "disposition", filters }),
+  () => groupedChart({ selectExpression: "group_name", filters }),
+  () => groupedChart({ selectExpression: "shift", filters, orderBy: "name ASC" }),
+  () => shiftMetricChart(filters, CONNECTED_SQL),
+  () => shiftMetricChart(filters, NOT_CONNECTED_SQL),
+  () => groupedChart({ selectExpression: "sub_disposition", filters, limit: 5 }),
+  () => agentAnalytics(filters, "top"),
+  () => agentAnalytics(filters, "bottom"),
+  () => getCallsByYear(filters),
+  () => getCallsByMonth(filters),
+  () => getHourly(filters)
+], 4);
 
   const charts = {
     callEnd,
@@ -630,13 +654,13 @@ callsByMonth
 
 export async function getFilterValues() {
   const [years, months, groups, agents, dispositions, subDispositions, shifts] = await Promise.all([
-    query("SELECT DISTINCT YEAR(call_time) AS value FROM inbound_calls WHERE call_time IS NOT NULL ORDER BY value DESC"),
-    query("SELECT DISTINCT MONTH(call_time) AS value FROM inbound_calls WHERE call_time IS NOT NULL ORDER BY value"),
-    query("SELECT DISTINCT group_name AS value FROM inbound_calls WHERE group_name <> '' ORDER BY value"),
-    query("SELECT DISTINCT agent_id AS value FROM inbound_calls WHERE agent_id <> '' ORDER BY value"),
-    query("SELECT DISTINCT disposition AS value FROM inbound_calls WHERE disposition <> '' ORDER BY value"),
-    query("SELECT DISTINCT sub_disposition AS value FROM inbound_calls WHERE sub_disposition <> '' ORDER BY value"),
-    query("SELECT DISTINCT shift AS value FROM inbound_calls WHERE shift <> '' ORDER BY value")
+    query("SELECT DISTINCT YEAR(call_time) AS value FROM dbo.inbound_calls WHERE call_time IS NOT NULL ORDER BY value DESC"),
+    query("SELECT DISTINCT MONTH(call_time) AS value FROM dbo.inbound_calls WHERE call_time IS NOT NULL ORDER BY value"),
+    query("SELECT DISTINCT group_name AS value FROM dbo.inbound_calls WHERE group_name <> '' ORDER BY value"),
+    query("SELECT DISTINCT agent_id AS value FROM dbo.inbound_calls WHERE agent_id <> '' ORDER BY value"),
+    query("SELECT DISTINCT disposition AS value FROM dbo.inbound_calls WHERE disposition <> '' ORDER BY value"),
+    query("SELECT DISTINCT sub_disposition AS value FROM dbo.inbound_calls WHERE sub_disposition <> '' ORDER BY value"),
+    query("SELECT DISTINCT shift AS value FROM dbo.inbound_calls WHERE shift <> '' ORDER BY value")
   ]);
 
   return {

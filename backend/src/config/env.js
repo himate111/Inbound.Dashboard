@@ -16,11 +16,9 @@ export const env = {
   uploadDir: process.env.UPLOAD_DIR || "uploads",
   maxUploadSizeMb: Number(process.env.MAX_UPLOAD_SIZE_MB || 50),
   db: {
-    host: process.env.DB_HOST || "localhost",
-    port: Number(process.env.DB_PORT || 3306),
-    user: process.env.DB_USER || "root",
-    password: process.env.DB_PASSWORD || "",
+    server: process.env.DB_SERVER || "LENOVO\\SQLEXPRESS",
     database: process.env.DB_NAME || "call_center_dashboard",
+    driver: process.env.DB_DRIVER || "ODBC Driver 18 for SQL Server",
     connectionLimit: Number(process.env.DB_CONNECTION_LIMIT || 10)
   }
 };

@@ -1,23 +1,46 @@
-import mysql from "mysql2/promise";
+import sql from "mssql/msnodesqlv8.js";
 import { env } from "./env.js";
 
-export const pool = mysql.createPool({
-  host: env.db.host,
-  port: env.db.port,
-  user: env.db.user,
-  password: env.db.password,
+const config = {
+  server: env.db.server,
   database: env.db.database,
-  waitForConnections: true,
-  connectionLimit: env.db.connectionLimit,
-  timezone: "Z",
-  decimalNumbers: true
-});
+  driver: env.db.driver,
+  connectionString: [
+    `Driver={${env.db.driver}}`,
+    `Server=lpc:${env.db.server}`,
+    `Database=${env.db.database}`,
+    "Trusted_Connection=Yes",
+    "Encrypt=Yes",
+    "TrustServerCertificate=Yes"
+  ].join(";"),
+
+  options: {
+    trustedConnection: true,
+    encrypt: true,
+    trustServerCertificate: true
+  },
+
+  requestTimeout: 60000,
+
+  pool: {
+    max: env.db.connectionLimit,
+    min: 0,
+    idleTimeoutMillis: 30000
+  }
+};
+
+export const pool = new sql.ConnectionPool(config);
 
 export async function checkDatabaseConnection() {
-  const connection = await pool.getConnection();
-  try {
-    await connection.ping();
-  } finally {
-    connection.release();
+  if (!pool.connected) {
+    await pool.connect();
   }
+
+  const result = await pool.request().query(`
+    SELECT 1 AS ok;
+  `);
+
+  return result.recordset[0];
 }
+
+export { sql };
